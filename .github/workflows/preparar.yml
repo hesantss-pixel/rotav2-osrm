@@ -57,21 +57,22 @@ jobs:
             echo "- Tempo: $(( (fim-ini)/60 )) min"
             echo "- Pico de memória (RAM + swap): $(cat pico.txt) MB"
             echo "- Arquivos prontos: $(du -sh dados | cut -f1)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Testar e medir a memória do servidor
         run: |
+          set +e   # uma medida que falhe não derruba a publicação
           med () {   # $1 = nome, $2 = opções extras do osrm-routed
-            docker rm -f t >/dev/null 2>&1 || true
-            docker run -d --name t -p 5000:5000 -v "$PWD/dados:/data" "$OSRM_IMG" osrm-routed --algorithm mld $2 /data/brasil.osrm >/dev/null
+            docker rm -f osrm-teste >/dev/null 2>&1 || true
+            docker run -d --name osrm-teste -p 5000:5000 -v "$PWD/dados:/data" "$OSRM_IMG" osrm-routed --algorithm mld $2 /data/brasil.osrm >/dev/null
             for i in $(seq 1 120); do curl -sf "http://127.0.0.1:5000/route/v1/driving/-46.53,-23.46;-46.39,-23.42" >/dev/null && break; sleep 5; done
             # Guarulhos → Guarulhos, São Paulo → Recife, e uma tabela com 4 pontos
             r1=$(curl -sf "http://127.0.0.1:5000/route/v1/driving/-46.5330,-23.4612;-46.4060,-23.4388?overview=false" | python3 -c "import sys,json;d=json.load(sys.stdin);print(round(d['routes'][0]['distance']/1000,1),'km')")
             r2=$(curl -sf "http://127.0.0.1:5000/route/v1/driving/-46.6333,-23.5505;-34.8770,-8.0476?overview=false" | python3 -c "import sys,json;d=json.load(sys.stdin);print(round(d['routes'][0]['distance']/1000),'km')")
             t=$(curl -sf "http://127.0.0.1:5000/table/v1/driving/-46.53,-23.46;-46.39,-23.42;-46.31,-23.39;-51.23,-30.03?annotations=distance" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['code'])")
-            mem=$(docker stats --no-stream --format '{{.MemUsage}}' t)
-            echo "- $1: memória $mem · Guarulhos→Cumbica $r1 · São Paulo→Recife $r2 · tabela $t" >> "$GITHUB_STEP_SUMMARY"
-            docker rm -f t >/dev/null
+            mem=$(docker stats --no-stream --format '{{.MemUsage}}' osrm-teste)
+            echo "- $1: memória $mem · Guarulhos→Cumbica $r1 · São Paulo→Recife $r2 · tabela $t" | tee -a "$GITHUB_STEP_SUMMARY"
+            docker rm -f osrm-teste >/dev/null
           }
           echo "### Servidor" >> "$GITHUB_STEP_SUMMARY"
           med "Tudo na memória" ""
