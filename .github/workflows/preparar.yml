@@ -1,0 +1,95 @@
+# Prepara o mapa do Brasil para o OSRM e publica a imagem que o Railway roda.
+# Roda à mão (Actions → "Preparar mapa do Brasil" → Run workflow) e todo dia 3 de cada mês,
+# para o mapa acompanhar as ruas novas do OpenStreetMap.
+name: Preparar mapa do Brasil
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 3 * *'   # dia 3, 03:17 em Brasília
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  OSRM_IMG: ghcr.io/project-osrm/osrm-backend:v5.27.1
+  MAPA: https://download.geofabrik.de/south-america/brazil-latest.osm.pbf
+
+jobs:
+  preparar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Liberar disco e ligar memória extra (swap)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 20G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile >/dev/null && sudo swapon /mnt/swapfile
+          echo "### Máquina" >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; nproc; free -h; df -h / /mnt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Baixar o mapa do Brasil (Geofabrik, OpenStreetMap)
+        run: |
+          mkdir -p dados
+          curl -fSL --retry 3 -o dados/brasil.osm.pbf "$MAPA"
+          echo "Mapa: $(du -h dados/brasil.osm.pbf | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preparar o mapa para rotas (extract, partition, customize)
+        run: |
+          # mede o pico de memória usada (RAM + swap) durante a preparação
+          ( pico=0; while true; do u=$(free -m | awk '/Mem:/{m=$3} /Swap:/{s=$3} END{print m+s}'); [ "$u" -gt "$pico" ] && pico=$u && echo $pico > pico.txt; sleep 5; done ) &
+          MED=$!
+          docker pull -q "$OSRM_IMG"
+          ini=$(date +%s)
+          docker run --rm -v "$PWD/dados:/data" "$OSRM_IMG" osrm-extract -p /opt/car.lua /data/brasil.osm.pbf
+          docker run --rm -v "$PWD/dados:/data" "$OSRM_IMG" osrm-partition /data/brasil.osrm
+          docker run --rm -v "$PWD/dados:/data" "$OSRM_IMG" osrm-customize /data/brasil.osrm
+          fim=$(date +%s)
+          kill $MED || true
+          rm -f dados/brasil.osm.pbf
+          {
+            echo "### Preparação"
+            echo "- Tempo: $(( (fim-ini)/60 )) min"
+            echo "- Pico de memória (RAM + swap): $(cat pico.txt) MB"
+            echo "- Arquivos prontos: $(du -sh dados | cut -f1)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Testar e medir a memória do servidor
+        run: |
+          med () {   # $1 = nome, $2 = opções extras do osrm-routed
+            docker rm -f t >/dev/null 2>&1 || true
+            docker run -d --name t -p 5000:5000 -v "$PWD/dados:/data" "$OSRM_IMG" osrm-routed --algorithm mld $2 /data/brasil.osrm >/dev/null
+            for i in $(seq 1 120); do curl -sf "http://127.0.0.1:5000/route/v1/driving/-46.53,-23.46;-46.39,-23.42" >/dev/null && break; sleep 5; done
+            # Guarulhos → Guarulhos, São Paulo → Recife, e uma tabela com 4 pontos
+            r1=$(curl -sf "http://127.0.0.1:5000/route/v1/driving/-46.5330,-23.4612;-46.4060,-23.4388?overview=false" | python3 -c "import sys,json;d=json.load(sys.stdin);print(round(d['routes'][0]['distance']/1000,1),'km')")
+            r2=$(curl -sf "http://127.0.0.1:5000/route/v1/driving/-46.6333,-23.5505;-34.8770,-8.0476?overview=false" | python3 -c "import sys,json;d=json.load(sys.stdin);print(round(d['routes'][0]['distance']/1000),'km')")
+            t=$(curl -sf "http://127.0.0.1:5000/table/v1/driving/-46.53,-23.46;-46.39,-23.42;-46.31,-23.39;-51.23,-30.03?annotations=distance" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['code'])")
+            mem=$(docker stats --no-stream --format '{{.MemUsage}}' t)
+            echo "- $1: memória $mem · Guarulhos→Cumbica $r1 · São Paulo→Recife $r2 · tabela $t" >> "$GITHUB_STEP_SUMMARY"
+            docker rm -f t >/dev/null
+          }
+          echo "### Servidor" >> "$GITHUB_STEP_SUMMARY"
+          med "Tudo na memória" ""
+          med "Lendo do disco (--mmap)" "--mmap"
+
+      - name: Publicar a imagem (ghcr.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.run_number }}
+      - name: Anotar a imagem publicada
+        run: |
+          echo "Imagem publicada: ghcr.io/${{ github.repository }}:latest" >> "$GITHUB_STEP_SUMMARY"
